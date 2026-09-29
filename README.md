@@ -129,6 +129,16 @@ first line repeating the title, at least one `Enhancements:` / `Bugs fixed:` /
 marked up as headings or in bold — are checked by grep inside the review job,
 before the model starts.
 
+Claude Code cloud sessions append an advert to every pull request they open -
+a `🤖 Generated with [Claude Code]` line and a `claude.ai/code/session_` link -
+whatever the session is told. That is not reported: it is **removed from the
+pull request** before any gate runs, the human-approval skip included, since
+the body ships however the review is decided. Only whole lines that are
+nothing but the advert go, with a `---` rule their removal leaves dangling at
+the end. The edit is made with the workflow's own token, so it does not start
+another run; if it fails, the body is left alone and the grep reports the
+advert as before.
+
 The shape of the description as a whole is not checked here. Enforcing it
 after a run has started costs a CI cycle and a review cycle to say something
 that was knowable before either began, so it belongs at the point the
