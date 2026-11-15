@@ -485,11 +485,11 @@ jobs:
           echo "::notice::a human reviewer has already approved this PR — skipping the automated review"
         fi
 
-    # A pins-only PR from a dependency bot is approved here directly rather
-    # than by the model. Detection is a heuristic (author + branch prefix,
-    # plus a PR-description marker for Renovate), not proof - see
-    # ghul-lang/ghul#2006. Any file outside the allowlist below falls through
-    # to the full review as normal.
+    # A dependency bot's bump is approved here directly rather than by the
+    # model. Detection is a heuristic (author, branch prefix and the authors
+    # of every commit), not proof - see ghul-lang/ghul#2006. A file outside
+    # the allowlist below, or a change that is not a version bump, falls
+    # through to the full review as normal.
     - name: Check for a mechanical dependency-only change
       id: dependency_only
       if: github.event_name == 'pull_request' && steps.human_approval.outputs.found != 'true' && inputs.dependency-fast-path
@@ -498,36 +498,43 @@ jobs:
 
         author=$(jq -r '.author.login' .review-context/pr.json)
         head_ref=$(jq -r '.headRefName' .review-context/pr.json)
-        body=$(jq -r '.body' .review-context/pr.json)
 
         # gh's --json author reports a GitHub App actor's login with an
         # "app/" prefix (e.g. "app/ghul-coder"), not the "ghul-coder[bot]"
-        # form the REST API and the PR/commit UI use.
+        # form the REST API, commit authors and the PR/commit UI use.
         #
         # Renovate runs as this fleet's own App, which also opens ordinary
-        # pull requests, so the branch prefix and the description marker are
-        # what separate a Renovate run from the rest of that App's work.
-        # Dependabot is GitHub's own App and opens nothing else, so its
-        # author and branch prefix identify it on their own.
-        looks_like_dependency_bot=false
-        if [ "$author" = "app/ghul-coder" ] \
-          && [[ "$head_ref" == renovate/* ]] \
-          && grep -q '<!--renovate-debug:' <<< "$body"; then
-          looks_like_dependency_bot=true
-        elif [ "$author" = "app/dependabot" ] \
-          && [[ "$head_ref" == dependabot/* ]]; then
-          looks_like_dependency_bot=true
+        # pull requests, so the branch prefix is what separates a Renovate
+        # run from the rest of that App's work. Dependabot is GitHub's own
+        # App and opens nothing else.
+        #
+        # Every commit has to be authored by the bot alone, so a commit
+        # someone else added to the bot's branch sends the change to the full
+        # review. A Co-authored-by trailer counts as another author.
+        bot_login=""
+        if [ "$author" = "app/ghul-coder" ] && [[ "$head_ref" == renovate/* ]]; then
+          bot_login="ghul-coder[bot]"
+        elif [ "$author" = "app/dependabot" ] && [[ "$head_ref" == dependabot/* ]]; then
+          bot_login="dependabot[bot]"
         fi
 
-        # Version-pin files only. Workflow YAML is deliberately excluded -
-        # CODEOWNERS coverage on .github/workflows/ isn't confirmed on every
-        # repo this fleet reviews, so an action bump still gets a full review.
-        pin_pattern='(^|/)(Directory\.Packages\.props|Directory\.Build\.props|\.config/dotnet-tools\.json|package\.json|package-lock\.json|npm-shrinkwrap\.json|Dockerfile)$|\.(csproj|ghulproj)$'
+        looks_like_dependency_bot=false
+        if [ -n "$bot_login" ] && jq -e --arg bot "$bot_login" \
+            '(.commits | length) > 0 and all(.commits[]; (.authors | length) > 0 and all(.authors[]; .login == $bot))' \
+            .review-context/pr.json > /dev/null; then
+          looks_like_dependency_bot=true
+        elif [ -n "$bot_login" ]; then
+          echo "::notice::a commit on $head_ref is not authored by $bot_login alone - not taking the dependency fast path"
+        fi
+
+        # Version-pin files, lock files and workflow files only.
+        pin_pattern='(^|/)(Directory\.Packages\.props|Directory\.Build\.props|\.config/dotnet-tools\.json|global\.json|package\.json|package-lock\.json|npm-shrinkwrap\.json|Dockerfile)$|\.(csproj|ghulproj)$|^\.github/workflows/[^/]+\.ya?ml$'
 
         only_pins=true
         while IFS= read -r f; do
           [ -z "$f" ] && continue
           if ! [[ "$f" =~ $pin_pattern ]]; then
+            echo "::notice::$f is not a version-pin file"
             only_pins=false
           fi
         done < <(jq -r '.files[].path' .review-context/pr.json)
@@ -537,26 +544,44 @@ jobs:
         # changed line of the same shape, differing only in version numbers
         # and content hashes. An added or removed line - a new dependency, a
         # new RUN step - sends the change to the full review.
+        #
+        # A lock file is the exception. Lock-file maintenance and an ordinary
+        # bump both add and remove resolved entries in it, so its lines are
+        # not compared; what it may resolve is bounded by the manifests,
+        # which are. In a workflow file, a version is often a bare number
+        # (`@v5`, `node-version: '24'`), so on the lines that name one -
+        # `uses:`, a `*-version:` key, `image:` - a bare number counts as a
+        # version too.
         versions_only=true
         if ! perl -ne '
             sub norm {
-                my $s = shift;
+                my ($s, $workflow) = @_;
                 $s =~ s/sha(?:1|256|384|512)[-:][0-9A-Za-z+\/=]+/H/g;
                 $s =~ s/\b[0-9a-f]{40,}\b/H/g;
-                $s =~ s/\d+(?:\.\d+)+(?:[-+][0-9A-Za-z.-]+)?/V/g;
+                if ($workflow && $s =~ /^\s*-?\s*(?:uses|[\w-]*-version|image)\s*:/) {
+                    $s =~ s/\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?/V/g;
+                } else {
+                    $s =~ s/\d+(?:\.\d+)+(?:[-+][0-9A-Za-z.-]+)?/V/g;
+                }
                 return $s;
             }
             sub flush {
-                if (join("\0", @r) ne join("\0", @a)) {
+                if (!$lock && join("\0", @r) ne join("\0", @a)) {
                     print "::notice::$file changes more than versions\n";
                     $bad = 1;
                 }
                 @r = (); @a = ();
             }
-            if (/^diff --git a\/(\S+)/) { flush(); $file = $1; next }
+            if (/^diff --git a\/(\S+)/) {
+                flush();
+                $file = $1;
+                $lock = $file =~ m{(^|/)(package-lock\.json|npm-shrinkwrap\.json)$};
+                $workflow = $file =~ m{^\.github/workflows/};
+                next;
+            }
             next if /^(?:---|\+\+\+) /;
-            if (/^-(.*)/s) { push @r, norm($1); next }
-            if (/^\+(.*)/s) { push @a, norm($1); next }
+            if (/^-(.*)/s) { push @r, norm($1, $workflow); next }
+            if (/^\+(.*)/s) { push @a, norm($1, $workflow); next }
             flush();
             END { flush(); exit($bad ? 1 : 0) }
         ' .review-context/diff.patch; then
@@ -565,7 +590,7 @@ jobs:
 
         if [ "$looks_like_dependency_bot" = "true" ] && [ "$only_pins" = "true" ] && [ "$versions_only" = "true" ]; then
           echo "match=true" >> "$GITHUB_OUTPUT"
-          echo "::notice::mechanical dependency-only bot PR (pins/version files only) — approving without a full review"
+          echo "::notice::dependency fast path: $bot_login bump in version-pin, lock and workflow files only - approving without running the model"
         else
           echo "match=false" >> "$GITHUB_OUTPUT"
         fi
@@ -577,7 +602,7 @@ jobs:
       run: |
         set -euo pipefail
         gh pr review "${{ env.PR_NUMBER }}" --repo "${{ github.repository }}" \
-          --approve --body "**Not reviewed** - mechanical dependency-only update: versions and hashes changed in version-pin files only, from a dependency bot, so the model was not run.
+          --approve --body "**Not reviewed** - mechanical dependency-only update: a dependency bot changed only versions and hashes, in version-pin, lock and workflow files, so the model was not run.
 
         CI is the gate for whether the bump itself is safe. A source-touching commit on this pull request routes back through the full review automatically."
 
