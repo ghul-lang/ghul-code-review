@@ -32,12 +32,20 @@ Three gates run before the model is ever started, in this order. Each is a
 whole run's cost avoided, and none of them leaves the PR without a review.
 
 - **A human has approved.** See 'Human override' below.
-- **A mechanical dependency-only bot PR.** From Renovate or Dependabot,
-  touching version-pin files only, and changing nothing in them but version
-  numbers and content hashes: every changed line has to be a changed line of
-  the same shape, so an added dependency or an added build step goes to the
-  full review. Approved directly. A caller turns this off with
-  `dependency-fast-path: false`.
+- **A mechanical dependency-only bot PR.** From Renovate (the fleet's App
+  on a `renovate/` branch) or Dependabot, with every commit authored by the
+  bot alone, touching version-pin, lock and workflow files only, and
+  changing nothing in the pin and workflow files but version numbers and
+  content hashes: every changed line has to be a changed line of the same
+  shape, so an added dependency or an added build step goes to the full
+  review. Lock files are not compared line by line, since maintenance and
+  ordinary bumps add and remove resolved entries; the manifests bound what
+  they resolve. In a workflow file a bare number counts as a version on a
+  `uses:`, `*-version:` or `image:` line, so an action or Node bump passes and
+  a `timeout-minutes` change doesn't. Approved directly, so a workflow bump
+  merges on CI alone. A caller turns this off with
+  `dependency-fast-path: false`. `tests/dependency-fast-path.sh` runs the
+  check against fixture pull requests.
 - **The reviewed content has not changed since the last review.** A rebase, a
   merge from the base branch, or a force-push that only rewrites history
   produces the same diff, and the last review already covers it — so that
